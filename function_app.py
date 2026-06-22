@@ -3,10 +3,11 @@
 PDF Form Field Mapping — Azure Function (v2 programming model)
 
 Environment variables required:
-  AZURE_OPENAI_API_KEY        – your Azure OpenAI key
-  AZURE_OPENAI_ENDPOINT       – e.g. https://<resource>.openai.azure.com/
-  AZURE_OPENAI_DEPLOYMENT     – deployment name (e.g. gpt-4o-mini)
-  AZURE_OPENAI_API_VERSION    – e.g. 2024-02-01
+  AZURE_OPENAI_API_KEY          – your Azure OpenAI key
+  AZURE_OPENAI_ENDPOINT         – e.g. https://<resource>.openai.azure.com/
+  AZURE_OPENAI_DEPLOYMENT       – deployment name (e.g. gpt-5)
+  AZURE_OPENAI_API_VERSION      – e.g. 2025-04-01-preview (GPT-5 needs a 2025 version)
+  AZURE_OPENAI_REASONING_EFFORT – optional, default "low" (minimal|low|medium|high)
 
 HTTP GET:
   /api/process?url=<PUBLIC_PDF_URL>[&id=<OPTIONAL_ID>][&debug=true]
@@ -29,9 +30,9 @@ from openai import AzureOpenAI
 _client = AzureOpenAI(
     api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-04-01-preview"),
 )
-_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+_DEPLOYMENT = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-5")
 
 # ---------------------------------------------------------------------------
 # Configurable thresholds
@@ -536,6 +537,13 @@ def map_fields_with_azure_openai(text_output, fields_list):
         "     - If a field spans multiple lines, you may format multiple attribute IDs up to the field's `size` (number of lines).\n"
         "     - Drop the lowest-priority line if there isn't enough room.\n"
         "  4. **General guidance**\n"
+        "     - The form text is machine-extracted and field placeholders are inserted near where the\n"
+        "       field sits on the page. Placement is approximate and sometimes WRONG — a placeholder may\n"
+        "       land a line above/below, or to the side of, the label it actually belongs to. Do not map\n"
+        "       purely by adjacency. Infer each field's true purpose from the nearest meaningful label,\n"
+        "       the field's internal name, and the overall context of the form (its caption, headings,\n"
+        "       and the role of nearby people/parties). When the placeholder seems mis-positioned, trust\n"
+        "       the semantics of the surrounding text over raw proximity.\n"
         "     - Always prefer Full Name (`{166FD}`) over splitting first/last, unless the label specifies otherwise.\n"
         "     - Use the form's visible label and surrounding text as your primary guide.\n"
         "     - Also consider the internal field name as a secondary hint.\n"
@@ -561,13 +569,18 @@ def map_fields_with_azure_openai(text_output, fields_list):
         "Apply the mapping rules above and return **only** the JSON object described."
     )
 
+    # GPT-5 (and other reasoning models) only accept the default temperature,
+    # so we omit it. response_format forces valid JSON; reasoning_effort is kept
+    # low because field mapping is structured extraction rather than open-ended
+    # reasoning, which keeps latency and token cost down.
     resp = _client.chat.completions.create(
         model=_DEPLOYMENT,
         messages=[
             {"role": "system", "content": system_instructions},
             {"role": "user",   "content": user_prompt},
         ],
-        temperature=0.3,
+        response_format={"type": "json_object"},
+        reasoning_effort=os.environ.get("AZURE_OPENAI_REASONING_EFFORT", "low"),
     )
 
     payload = json.loads(resp.choices[0].message.content)

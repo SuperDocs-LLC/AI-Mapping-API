@@ -1,5 +1,5 @@
 azure-functions
-openai>=1.0.0
+openai>=1.55
 pdfplumber
 PyPDF2
 requests
