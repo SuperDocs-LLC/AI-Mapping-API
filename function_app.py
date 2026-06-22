@@ -436,34 +436,36 @@ def assign_labels_and_lines(fields, phrases, y_tol=DEFAULT_Y_TOLERANCE):
                 label = min(cands, key=lambda ph: ph['center'][0] - brx)
                 fld['label_id'], fld['label'] = label['id'], label['text']
 
+    # Associate each text field with its caption using geometry. The caption is the
+    # phrase immediately to the LEFT of the field whose vertical CENTER lies within the
+    # field's vertical span. Field boxes are taller than the caption text and sit
+    # slightly above it, so matching box TOPS (the old approach) bound fields to the
+    # caption one row up. Matching by caption-center-within-span fixes that off-by-one.
     for fld in fields:
-        if fld['type'] in ('Text', 'Multiline') and fld['page'] and fld['line'] and fld.get('top_left'):
-            fx, fy = fld['top_left']
-            same_line = [ph for ph in phrases
-                         if ph['page'] == fld['page'] and ph['line'] == fld['line']]
-            close = []
-            for ph in same_line:
-                prx = ph['bottom_right'][0]; pry = ph['top_left'][1]
-                if abs(pry - fy) <= y_tol and abs(prx - fx) <= DEFAULT_SPACE_GAP:
-                    close.append(ph)
-            if close:
-                label = max(close, key=lambda p: p['bottom_right'][0])
-                fld['label_id'], fld['label'] = label['id'], label['text']
+        if fld['type'] in ('Text', 'Multiline') and fld['page'] and fld.get('top_left') and fld.get('bottom_right'):
+            fx0    = fld['top_left'][0]       # field left edge
+            fy_top = fld['top_left'][1]       # field top (smaller y, page origin top-left)
+            fy_bot = fld['bottom_right'][1]   # field bottom (larger y)
+            pg = fld['page']
 
-    for fld in fields:
-        if (fld['type'] in ('Text', 'Multiline') and fld.get('label_id') is None
-                and fld['page'] and fld['line'] and fld.get('top_left')):
-            fx, fy = fld['top_left']; ln = fld['line']; pg = fld['page']
-            for target in (ln - 1, ln + 1):
-                if target > 0:
-                    cands = [ph for ph in phrases if ph['page'] == pg and ph['line'] == target]
-                    if cands:
-                        if target == ln + 1:
-                            cands = [ph for ph in cands if abs(ph['center'][1] - fy) <= 4]
-                        if cands:
-                            label = min(cands, key=lambda p: abs(p['center'][0] - fx))
-                            fld['label_id'], fld['label'] = label['id'], label['text']
-                            break
+            # (a) caption to the left on the field's own row (its center within the span)
+            same_row = [ph for ph in phrases
+                        if ph['page'] == pg
+                        and fy_top <= ph['center'][1] <= fy_bot
+                        and ph['bottom_right'][0] <= fx0 + DEFAULT_SPACE_GAP]
+            if same_row:
+                label = max(same_row, key=lambda p: p['bottom_right'][0])  # closest to field's left
+                fld['label_id'], fld['label'] = label['id'], label['text']
+            else:
+                # (b) fallback: nearest caption directly above whose x-range overlaps the field
+                above = [ph for ph in phrases
+                         if ph['page'] == pg
+                         and ph['center'][1] < fy_top
+                         and ph['top_left'][0] < fld['bottom_right'][0]
+                         and ph['bottom_right'][0] > fx0]
+                if above:
+                    label = max(above, key=lambda p: p['center'][1])  # closest above
+                    fld['label_id'], fld['label'] = label['id'], label['text']
 
     for fld in fields:
         lid = fld.get('label_id')
@@ -529,25 +531,13 @@ def map_fields_with_azure_openai(text_output, fields_geo, phrases_geo):
         "  (1) TEXT: a readable rendering of the form. It is APPROXIMATE — field placeholders embedded in it\n"
         "      are positioned by a heuristic and are frequently WRONG. Use TEXT only for semantic context and\n"
         "      reading order. NEVER decide a field's label from where its placeholder appears in TEXT.\n"
-        "  (2) PHRASES: every visible text snippet with its bounding box.\n"
-        "  (3) FIELDS: every fillable field with its bounding box, type, size (lines), and an `approx_label`\n"
-        "      that is a heuristic guess and is OFTEN WRONG — do not trust it; verify with geometry.\n\n"
-        "COORDINATES & LABEL ASSOCIATION (this is the authoritative method):\n"
-        "  - Every box is [x0, y0, x1, y1] in PDF points (72/inch). Origin is the page TOP-LEFT; x grows to the\n"
-        "    RIGHT, y grows DOWNWARD. So smaller y = higher on the page.\n"
-        "  - A phrase is on the SAME ROW as a field when their vertical extents overlap (e.g. the phrase's\n"
-        "    vertical center lies between the field's y0 and y1, or vice-versa). Field boxes are often taller\n"
-        "    than their label text, so do NOT require their top edges to match.\n"
-        "  - To find a field's label:\n"
-        "      a. FIRST choose the phrase on the same row whose right edge (x1) is at or just left of the field's\n"
-        "         left edge (x0) and closest to it — i.e. the caption immediately preceding the field. Captions\n"
-        "         usually end with ':'.\n"
-        "      b. If there is none on the row, use the nearest phrase directly ABOVE the field (smaller y) whose\n"
-        "         x-range overlaps the field.\n"
-        "      c. IGNORE distant phrases, page headers/footers, and form codes (e.g. 'EJ-130', 'MC-012').\n"
-        "  - Worked example of the failure to avoid: a field at [259,44,366,57] with caption 'STATE BAR NO.:' at\n"
-        "    [209,49,257,55] (right edge 257, just left of 259, rows overlap) takes that caption — NOT a form\n"
-        "    code like 'EJ-130' sitting far away at the top-right corner.\n\n"
+        "  (2) PHRASES: every visible text snippet with its bounding box (supporting context).\n"
+        "  (3) FIELDS: every fillable field with its bounding box, type, size (lines), and `label` — the\n"
+        "      field's caption (the visible text immediately preceding it), already determined from the page\n"
+        "      layout. Treat `label` as the AUTHORITATIVE description of what the field captures.\n\n"
+        "Use each field's `label` as the primary signal for what it is; boxes/PHRASES are only supporting\n"
+        "context. Map distinct fields independently even when their internal names are nearly identical\n"
+        "(e.g. 'TextField29' vs 'TextField292'). Boxes are [x0, y0, x1, y1] in points, origin top-left.\n\n"
         "Mapping rules:\n"
         "  1. **Contacts**\n"
         "     - If a field pertains to a person or court (attorney, client, court), set `group` to the Contacts group ID.\n"
@@ -590,7 +580,7 @@ def map_fields_with_azure_openai(text_output, fields_geo, phrases_geo):
         f"{text_output}\n\n"
         "PHRASES — visible text with boxes [x0,y0,x1,y1], grouped per page:\n"
         f"{json.dumps(phrases_geo, separators=(',', ':'))}\n\n"
-        "FIELDS — fillable fields with box [x0,y0,x1,y1], type, size (lines), and a fallible approx_label:\n"
+        "FIELDS — fillable fields with `label` (the field's caption), type, size (lines), and box for reference:\n"
         f"{json.dumps(fields_geo, separators=(',', ':'))}\n\n"
         "For each field, determine its true caption from the COORDINATES (per the rules above), then apply the "
         "mapping rules. Return **only** the JSON object described."
@@ -661,7 +651,7 @@ def process_pdf_stream(pdf_bytes):
             'page': fld['page'],
             'size': m['size'],
             'box': _round_box(fld),
-            'approx_label': fld.get('label'),
+            'label': fld.get('label'),
         })
 
     return map_fields_with_azure_openai(text_out, fields_geo, phrases_geo)
