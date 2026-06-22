@@ -1,0 +1,19 @@
+# Azure Functions local settings (contains secrets)
+local.settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Azure Functions artifacts
+bin/
+obj/
+.python_packages/
+.azure/
