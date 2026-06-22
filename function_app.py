@@ -598,7 +598,10 @@ def map_fields_with_azure_openai(text_output, fields_list):
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def process_pdf_stream(pdf_bytes):
+def build_model_inputs(pdf_bytes):
+    """Run extraction + label assignment and return exactly what the model sees:
+    the text representation of the form and the per-field list (name/type/label/size).
+    Exposed separately so it can be inspected (dump mode) without an LLM call."""
     phrases = extract_phrases_from_bytes(pdf_bytes, DEFAULT_Y_TOLERANCE)
     fields  = extract_fields_from_bytes(pdf_bytes)
     assign_labels_and_lines(fields, phrases, DEFAULT_Y_TOLERANCE)
@@ -612,6 +615,11 @@ def process_pdf_stream(pdf_bytes):
         else:
             entry['size'] = 1
         minimal.append(entry)
+    return text_out, minimal
+
+
+def process_pdf_stream(pdf_bytes):
+    text_out, minimal = build_model_inputs(pdf_bytes)
     return map_fields_with_azure_openai(text_out, minimal)
 
 # ---------------------------------------------------------------------------
@@ -625,6 +633,7 @@ def process(req: func.HttpRequest) -> func.HttpResponse:
     url         = req.params.get('url')
     id_param    = req.params.get('id')
     debug_param = req.params.get('debug', '').lower()
+    dump_param  = req.params.get('dump', '').lower()
 
     if not url:
         return func.HttpResponse(
@@ -640,6 +649,21 @@ def process(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({'error': f'Failed to download PDF: {e}'}),
             status_code=400, mimetype="application/json"
+        )
+
+    # Diagnostic mode: return the exact text + field/label inputs the model would
+    # receive, WITHOUT calling the LLM. Use to inspect label-assignment quality.
+    if dump_param == 'true':
+        try:
+            text_out, minimal = build_model_inputs(pdf_bytes)
+        except Exception as e:
+            return func.HttpResponse(
+                json.dumps({'error': f'Processing error: {e}'}),
+                status_code=500, mimetype="application/json"
+            )
+        return func.HttpResponse(
+            json.dumps({'text': text_out, 'fields': minimal}, indent=2),
+            mimetype="application/json"
         )
 
     try:
