@@ -515,7 +515,7 @@ def write_text_from_phrases_to_string(phrases, fields):
 # Azure OpenAI mapping (replaces map_fields_with_openai)
 # ---------------------------------------------------------------------------
 
-def map_fields_with_azure_openai(text_output, fields_list):
+def map_fields_with_azure_openai(text_output, fields_geo, phrases_geo):
     system_instructions = (
         "You are an AI assistant for SuperDocs.com, specialized in mapping court-form fields to database attributes.\n\n"
         "For each form field, you must return exactly one JSON object with four string keys:\n"
@@ -525,6 +525,29 @@ def map_fields_with_azure_openai(text_output, fields_list):
         "  • expression – one or more attribute IDs (e.g. \"{166FD}\") or blank, sometimes with text or formatting around them.\n"
         "                 attributes are swapped out with data, like a mail merge, so city, state zip would be {6FEB4}, {43D09} {4CA4D}\n"
         "                 to have proper punctuation and spacing between the data.\n\n"
+        "INPUT FORMAT — you receive THREE views of ONE court form:\n"
+        "  (1) TEXT: a readable rendering of the form. It is APPROXIMATE — field placeholders embedded in it\n"
+        "      are positioned by a heuristic and are frequently WRONG. Use TEXT only for semantic context and\n"
+        "      reading order. NEVER decide a field's label from where its placeholder appears in TEXT.\n"
+        "  (2) PHRASES: every visible text snippet with its bounding box.\n"
+        "  (3) FIELDS: every fillable field with its bounding box, type, size (lines), and an `approx_label`\n"
+        "      that is a heuristic guess and is OFTEN WRONG — do not trust it; verify with geometry.\n\n"
+        "COORDINATES & LABEL ASSOCIATION (this is the authoritative method):\n"
+        "  - Every box is [x0, y0, x1, y1] in PDF points (72/inch). Origin is the page TOP-LEFT; x grows to the\n"
+        "    RIGHT, y grows DOWNWARD. So smaller y = higher on the page.\n"
+        "  - A phrase is on the SAME ROW as a field when their vertical extents overlap (e.g. the phrase's\n"
+        "    vertical center lies between the field's y0 and y1, or vice-versa). Field boxes are often taller\n"
+        "    than their label text, so do NOT require their top edges to match.\n"
+        "  - To find a field's label:\n"
+        "      a. FIRST choose the phrase on the same row whose right edge (x1) is at or just left of the field's\n"
+        "         left edge (x0) and closest to it — i.e. the caption immediately preceding the field. Captions\n"
+        "         usually end with ':'.\n"
+        "      b. If there is none on the row, use the nearest phrase directly ABOVE the field (smaller y) whose\n"
+        "         x-range overlaps the field.\n"
+        "      c. IGNORE distant phrases, page headers/footers, and form codes (e.g. 'EJ-130', 'MC-012').\n"
+        "  - Worked example of the failure to avoid: a field at [259,44,366,57] with caption 'STATE BAR NO.:' at\n"
+        "    [209,49,257,55] (right edge 257, just left of 259, rows overlap) takes that caption — NOT a form\n"
+        "    code like 'EJ-130' sitting far away at the top-right corner.\n\n"
         "Mapping rules:\n"
         "  1. **Contacts**\n"
         "     - If a field pertains to a person or court (attorney, client, court), set `group` to the Contacts group ID.\n"
@@ -537,13 +560,6 @@ def map_fields_with_azure_openai(text_output, fields_list):
         "     - If a field spans multiple lines, you may format multiple attribute IDs up to the field's `size` (number of lines).\n"
         "     - Drop the lowest-priority line if there isn't enough room.\n"
         "  4. **General guidance**\n"
-        "     - The form text is machine-extracted and field placeholders are inserted near where the\n"
-        "       field sits on the page. Placement is approximate and sometimes WRONG — a placeholder may\n"
-        "       land a line above/below, or to the side of, the label it actually belongs to. Do not map\n"
-        "       purely by adjacency. Infer each field's true purpose from the nearest meaningful label,\n"
-        "       the field's internal name, and the overall context of the form (its caption, headings,\n"
-        "       and the role of nearby people/parties). When the placeholder seems mis-positioned, trust\n"
-        "       the semantics of the surrounding text over raw proximity.\n"
         "     - Always prefer Full Name (`{166FD}`) over splitting first/last, unless the label specifies otherwise.\n"
         "     - Distinguish a PERSON's name from an ORGANIZATION's name. A field labeled 'Firm Name',\n"
         "       'Law Firm', 'Firm', 'Attorney's Firm', or any company/office/agency name maps to the\n"
@@ -552,13 +568,13 @@ def map_fields_with_azure_openai(text_output, fields_list):
         "       (`{166FD}`) under that person's instance. Never map a firm/organization field to Full Name.\n"
         "     - Internal field names that are nearly identical (e.g. 'TextField29' vs 'TextField292', or\n"
         "       names differing only by a trailing index) are DIFFERENT fields. Map each strictly by its\n"
-        "       own visible label and position — do not copy a neighbor's mapping onto a similarly-named field.\n"
-        "     - Use the form's visible label and surrounding text as your primary guide.\n"
-        "     - Also consider the internal field name as a secondary hint.\n"
+        "       own geometry/label — do not copy a neighbor's mapping onto a similarly-named field.\n"
+        "     - Also consider the internal field name as a weak secondary hint; it can even CONTRADICT the\n"
+        "       visible label (e.g. a field internally named 'Defendant' sitting under a 'PLAINTIFF/PETITIONER:'\n"
+        "       caption). When they conflict, the visible caption wins.\n"
         "     - All forms are completed by attorneys or their firms.\n"
         "     - Be aware of the context of the form as a whole.\n"
         "     - Consistency: once you assign a group+instance for a given role, apply that same mapping to all other fields for that role.\n"
-        "     - Look for a matching substring in the last section of field's name to help with consistency.\n"
         "     - Omit any field you cannot confidently map.\n"
         "     - DO NOT USE any group, instance or attribute not provided to you in the Context JSON.\n\n"
         "You have access to a fixed Context JSON (attributes, groups, instances). You must not reference fields outside of that context.\n\n"
@@ -570,11 +586,14 @@ def map_fields_with_azure_openai(text_output, fields_list):
     )
 
     user_prompt = (
-        "Here is the **text** version of the court form:\n"
+        "TEXT (approximate; for semantic context only — do NOT infer labels from placeholder positions here):\n"
         f"{text_output}\n\n"
-        "And here is the list of **fields** (name, type, label, size):\n"
-        f"{json.dumps(fields_list, indent=2)}\n\n"
-        "Apply the mapping rules above and return **only** the JSON object described."
+        "PHRASES — visible text with boxes [x0,y0,x1,y1], grouped per page:\n"
+        f"{json.dumps(phrases_geo, separators=(',', ':'))}\n\n"
+        "FIELDS — fillable fields with box [x0,y0,x1,y1], type, size (lines), and a fallible approx_label:\n"
+        f"{json.dumps(fields_geo, separators=(',', ':'))}\n\n"
+        "For each field, determine its true caption from the COORDINATES (per the rules above), then apply the "
+        "mapping rules. Return **only** the JSON object described."
     )
 
     # GPT-5 (and other reasoning models) only accept the default temperature,
@@ -615,12 +634,37 @@ def build_model_inputs(pdf_bytes):
         else:
             entry['size'] = 1
         minimal.append(entry)
-    return text_out, minimal
+    return text_out, minimal, phrases, fields
+
+
+def _round_box(o):
+    """Return a field/phrase bounding box as [x0, y0, x1, y1] integers, or None."""
+    tl, br = o.get('top_left'), o.get('bottom_right')
+    if not tl or not br or tl[0] is None or br[0] is None:
+        return None
+    return [round(tl[0]), round(tl[1]), round(br[0]), round(br[1])]
 
 
 def process_pdf_stream(pdf_bytes):
-    text_out, minimal = build_model_inputs(pdf_bytes)
-    return map_fields_with_azure_openai(text_out, minimal)
+    text_out, minimal, phrases, fields = build_model_inputs(pdf_bytes)
+
+    # Authoritative geometry the model uses to associate captions with fields.
+    phrases_geo = [
+        {'page': ph['page'], 'text': ph['text'], 'box': _round_box(ph)}
+        for ph in phrases if _round_box(ph)
+    ]
+    fields_geo = []
+    for fld, m in zip(fields, minimal):
+        fields_geo.append({
+            'name': fld['name'],
+            'type': fld['type'],
+            'page': fld['page'],
+            'size': m['size'],
+            'box': _round_box(fld),
+            'approx_label': fld.get('label'),
+        })
+
+    return map_fields_with_azure_openai(text_out, fields_geo, phrases_geo)
 
 # ---------------------------------------------------------------------------
 # Azure Function app
@@ -655,14 +699,34 @@ def process(req: func.HttpRequest) -> func.HttpResponse:
     # receive, WITHOUT calling the LLM. Use to inspect label-assignment quality.
     if dump_param == 'true':
         try:
-            text_out, minimal = build_model_inputs(pdf_bytes)
+            text_out, minimal, phrases, fields = build_model_inputs(pdf_bytes)
         except Exception as e:
             return func.HttpResponse(
                 json.dumps({'error': f'Processing error: {e}'}),
                 status_code=500, mimetype="application/json"
             )
+        resp = {'text': text_out, 'fields': minimal}
+        # coords=true adds raw geometry for one page so label-binding can be
+        # inspected: each phrase box and each field rect (page-space, y-down).
+        if req.params.get('coords', '').lower() == 'true':
+            try:
+                page = int(req.params.get('page', '1') or 1)
+            except ValueError:
+                page = 1
+            resp['page'] = page
+            resp['phrases'] = [
+                {'id': p['id'], 'line': p['line'], 'text': p['text'],
+                 'top_left': p['top_left'], 'bottom_right': p['bottom_right'], 'center': p['center']}
+                for p in phrases if p['page'] == page
+            ]
+            resp['fields_detail'] = [
+                {'name': f['name'], 'type': f['type'], 'line': f['line'],
+                 'top_left': f['top_left'], 'bottom_right': f['bottom_right'], 'center': f['center'],
+                 'label_id': f.get('label_id'), 'label': f['label']}
+                for f in fields if f['page'] == page
+            ]
         return func.HttpResponse(
-            json.dumps({'text': text_out, 'fields': minimal}, indent=2),
+            json.dumps(resp, indent=2),
             mimetype="application/json"
         )
 
